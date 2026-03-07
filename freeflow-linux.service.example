@@ -1,0 +1,13 @@
+[Unit]
+Description=FreeFlow Linux voice dictation daemon
+After=graphical-session.target
+
+[Service]
+ExecStart=/home/YOUR_USERNAME/code/freeflow-linux/.venv/bin/python /home/YOUR_USERNAME/code/freeflow-linux/freeflow_linux.py
+Restart=on-failure
+RestartSec=3
+Environment=XDG_SESSION_TYPE=x11
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=default.target

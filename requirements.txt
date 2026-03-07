@@ -1,0 +1,6 @@
+groq
+sounddevice
+soundfile
+numpy
+evdev
+toml
