@@ -165,27 +165,13 @@ def paste_text(text: str, session: str):
             subprocess.run(["xdotool", "key", "ctrl+v"])
 
     elif session == "wayland":
-        compositor = get_compositor()
-        subprocess.run(["wl-copy", "--", text], check=True)
-        time.sleep(delay)
-
-        if compositor == "gnome":
-            # GNOME Wayland doesn't implement virtual-keyboard-unstable-v1
-            # Use ydotool with raw uinput keycodes (29=Ctrl, 47=v)
-            subprocess.run(
-                ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
-                check=True,
-            )
-        else:
-            # wlroots compositors and KDE support wtype
-            try:
-                subprocess.run(
-                    ["wtype", "-M", "ctrl", "-P", "v", "-m", "ctrl"],
-                    check=True,
-                )
-            except FileNotFoundError:
-                # Fallback to ydotool
-                subprocess.run(["ydotool", "key", "ctrl+v"], check=True)
+        # Type directly via ydotool — bypasses clipboard entirely (system services
+        # can't reach the user's Wayland clipboard socket reliably).
+        subprocess.run(
+            ["ydotool", "type", "--key-delay", "1", "--file", "-"],
+            input=encoded,
+            check=True,
+        )
 
     else:
         # Unknown session: try xclip (may work via XWayland)
@@ -218,29 +204,99 @@ class AudioRecorder:
     CHANNELS = 1
     DTYPE = "int16"
 
+    # After this many consecutive xrun errors, restart the stream automatically.
+    XRUN_RESTART_THRESHOLD = 50
+    # Proactively restart the stream every N seconds even if no errors, to prevent
+    # the long-running ALSA stream from drifting into an unrecoverable state.
+    STREAM_MAX_AGE_SECS = 1800  # 30 minutes
+
     def __init__(self, device=None):
         self._device = device
         self._frames: list = []
         self._recording = False
         self._stream = None
+        self._lock = threading.Lock()
+        self._xrun_count = 0
+        self._stream_started_at = 0.0
+        self._restarting = False
 
-    def start_stream(self):
-        """Call once at daemon startup — keeps stream warm to eliminate startup latency."""
+    def _open_stream(self):
+        """Create and start a fresh InputStream."""
         def callback(indata, frame_count, time_info, status):
+            if status:
+                # Any status flag (xrun, etc.) — count it
+                self._xrun_count += 1
+                if self._xrun_count == self.XRUN_RESTART_THRESHOLD:
+                    print(f"[freeflow] WARNING: {self.XRUN_RESTART_THRESHOLD} consecutive "
+                          f"audio errors — will restart stream", flush=True)
+            else:
+                # Good callback — reset counter
+                self._xrun_count = 0
+
             if self._recording:
                 self._frames.append(indata.copy())
 
-        self._stream = sd.InputStream(
+        stream = sd.InputStream(
             samplerate=self.SAMPLE_RATE,
             channels=self.CHANNELS,
             dtype=self.DTYPE,
             device=self._device,
             callback=callback,
         )
-        self._stream.start()
+        stream.start()
+        self._stream = stream
+        self._stream_started_at = time.monotonic()
+        self._xrun_count = 0
+        print("[freeflow] Audio stream opened", flush=True)
+
+    def _restart_stream(self):
+        """Close the current stream and open a fresh one. Safe to call from any thread."""
+        with self._lock:
+            if self._restarting:
+                return
+            self._restarting = True
+
+        try:
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+            self._open_stream()
+            print("[freeflow] Audio stream restarted successfully", flush=True)
+        finally:
+            with self._lock:
+                self._restarting = False
+
+    def _check_health(self):
+        """Check stream health and restart if needed. Called before each recording."""
+        needs_restart = False
+        age = time.monotonic() - self._stream_started_at
+
+        if self._xrun_count >= self.XRUN_RESTART_THRESHOLD:
+            print(f"[freeflow] Stream unhealthy ({self._xrun_count} xruns) — restarting",
+                  flush=True)
+            needs_restart = True
+        elif age > self.STREAM_MAX_AGE_SECS and not self._recording:
+            print(f"[freeflow] Stream age {age:.0f}s exceeds max — proactive restart",
+                  flush=True)
+            needs_restart = True
+        elif self._stream is None or not self._stream.active:
+            print("[freeflow] Stream not active — restarting", flush=True)
+            needs_restart = True
+
+        if needs_restart:
+            self._restart_stream()
+
+    def start_stream(self):
+        """Call once at daemon startup — keeps stream warm to eliminate startup latency."""
+        self._open_stream()
 
     def start_recording(self):
         """Called on key_down — zero latency since stream is already open."""
+        self._check_health()
         self._frames = []
         self._recording = True
 
@@ -249,9 +305,29 @@ class AudioRecorder:
         self._recording = False
 
         if not self._frames:
+            print("[freeflow] No audio frames captured", flush=True)
             return io.BytesIO()
 
         audio = np.concatenate(self._frames, axis=0)
+
+        # Validate: reject silence / near-silence (corrupt xrun data reads as zeros)
+        rms = float(np.sqrt(np.mean((audio.astype(np.float32) / 32768.0) ** 2)))
+        peak = float(np.max(np.abs(audio)) / 32768.0)
+        duration_secs = len(audio) / self.SAMPLE_RATE
+        print(f"[freeflow] Captured {len(audio)} samples ({duration_secs:.1f}s) — "
+              f"rms={rms:.4f} peak={peak:.4f}", flush=True)
+
+        if rms < 0.0005 and peak < 0.005:
+            print("[freeflow] Audio is silence/corrupt (rms/peak near zero) — "
+                  "restarting stream and skipping", flush=True)
+            self._restart_stream()
+            return io.BytesIO()
+
+        try:
+            sf.write("/tmp/freeflow-last.wav", audio, self.SAMPLE_RATE, subtype="PCM_16")
+        except Exception as e:
+            print(f"[freeflow] Debug WAV dump failed: {e}", flush=True)
+
         buf = io.BytesIO()
         sf.write(buf, audio, self.SAMPLE_RATE, format="WAV", subtype="PCM_16")
         buf.seek(0)
@@ -395,6 +471,12 @@ class FreeflowDaemon:
         print("[freeflow] Processing...")
         audio_buf = self._recorder.stop_recording()
 
+        # Empty buffer means no frames or corrupt audio — don't hit the API
+        if audio_buf.getbuffer().nbytes == 0:
+            print("[freeflow] No usable audio — skipping")
+            play_beep(frequency=220, duration=0.15, volume=0.2)  # low beep = error
+            return
+
         context = get_context(self._session)
 
         try:
@@ -415,6 +497,7 @@ class FreeflowDaemon:
 
         except Exception as e:
             print(f"[freeflow] Error: {e}")
+            play_beep(frequency=220, duration=0.15, volume=0.2)  # low beep = error
 
     async def _monitor_device(self, dev: InputDevice):
         try:
