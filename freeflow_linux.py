@@ -339,73 +339,26 @@ class AudioRecorder:
 # Groq integration
 # ---------------------------------------------------------------------------
 
-# Post-processing model fallback chain — if primary is over-capacity or erroring,
-# try alternates in order. First one that works wins.
-POST_PROCESS_MODELS = [
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-]
+# Fastest Groq model — snappiness wins over polish. Any error -> raw Whisper.
+POST_PROCESS_MODEL = "llama-3.1-8b-instant"
 
-# Transient HTTP statuses we retry on (rate limit + server errors)
-RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
-
-# Safety-net log: every transcript is appended here so nothing is ever lost,
-# even if paste fails or post-processing blows up. Tail it to see history.
+# Safety-net log: every transcript is appended here so nothing is ever lost.
 HISTORY_LOG = Path("/tmp/freeflow-history.log")
 
 
-def _is_retryable(exc: Exception) -> bool:
-    """Return True if the exception is a transient Groq error worth retrying."""
-    status = getattr(exc, "status_code", None)
-    if status in RETRYABLE_STATUS:
-        return True
-    # groq SDK exceptions often expose .response.status_code
-    resp = getattr(exc, "response", None)
-    if resp is not None and getattr(resp, "status_code", None) in RETRYABLE_STATUS:
-        return True
-    # Fallback: sniff the string (some SDK paths wrap as generic Exception)
-    msg = str(exc).lower()
-    return any(tok in msg for tok in ("503", "429", "over capacity", "rate limit", "timeout"))
-
-
-def _with_retries(fn, *, label: str, max_attempts: int = 3, base_delay: float = 0.8):
-    """Call fn() with exponential backoff on transient errors. Returns fn()'s result.
-
-    Re-raises the last exception if all attempts fail."""
-    last_exc = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return fn()
-        except Exception as e:  # noqa: BLE001 — we want to classify, not hide
-            last_exc = e
-            if not _is_retryable(e) or attempt == max_attempts:
-                raise
-            delay = base_delay * (2 ** (attempt - 1))
-            print(f"[freeflow] {label} transient error (attempt {attempt}/"
-                  f"{max_attempts}): {e} — retrying in {delay:.1f}s", flush=True)
-            time.sleep(delay)
-    raise last_exc  # unreachable, but keeps type checkers happy
-
-
 def transcribe(client: Groq, audio_buf: io.BytesIO) -> str:
-    def _call():
-        # BytesIO cursor may have been advanced by a previous failed attempt
-        audio_buf.seek(0)
-        result = client.audio.transcriptions.create(
-            model="whisper-large-v3",
-            file=audio_buf,
-        )
-        return result.text.strip()
-
-    return _with_retries(_call, label="Whisper")
+    """Single Whisper call. Raises on any error — caller handles."""
+    audio_buf.seek(0)
+    result = client.audio.transcriptions.create(
+        model="whisper-large-v3",
+        file=audio_buf,
+    )
+    return result.text.strip()
 
 
 def post_process(client: Groq, transcript: str, context: str = "") -> str:
-    """Clean up the raw transcript. Tries models in POST_PROCESS_MODELS order.
-
-    Raises the last exception if every model fails. Callers should catch this
-    and fall back to the raw transcript rather than losing the user's speech."""
+    """Single fast call to llama-3.1-8b-instant. Raises on any error — caller
+    is expected to fall back to the raw transcript immediately, no retries."""
     user_message = (
         f"Instructions: Clean up RAW_TRANSCRIPTION and return only the cleaned "
         f"transcript text without surrounding quotes. Return EMPTY if there should be no result.\n\n"
@@ -413,39 +366,23 @@ def post_process(client: Groq, transcript: str, context: str = "") -> str:
         f'RAW_TRANSCRIPTION: "{transcript}"'
     )
 
-    last_exc = None
-    for model in POST_PROCESS_MODELS:
-        def _call(m=model):
-            response = client.chat.completions.create(
-                model=m,
-                temperature=0.0,
-                messages=[
-                    {"role": "system", "content": POST_PROCESSING_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_message},
-                ],
-            )
-            return response.choices[0].message.content.strip()
+    response = client.chat.completions.create(
+        model=POST_PROCESS_MODEL,
+        temperature=0.0,
+        messages=[
+            {"role": "system", "content": POST_PROCESSING_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+    )
+    result = response.choices[0].message.content.strip()
 
-        try:
-            result = _with_retries(_call, label=f"Post-process ({model})", max_attempts=2)
-        except Exception as e:  # noqa: BLE001
-            last_exc = e
-            print(f"[freeflow] Model {model} failed: {e} — trying next", flush=True)
-            continue
+    # Strip outer quotes if the LLM wrapped the entire response
+    if len(result) >= 2 and result[0] == result[-1] and result[0] in ('"', "'"):
+        result = result[1:-1].strip()
 
-        # Strip outer quotes if the LLM wrapped the entire response
-        if len(result) >= 2 and result[0] == result[-1] and result[0] in ('"', "'"):
-            result = result[1:-1].strip()
-
-        if result == "EMPTY":
-            return ""
-        if model != POST_PROCESS_MODELS[0]:
-            print(f"[freeflow] Post-processed via fallback model: {model}", flush=True)
-        return result
-
-    # Every model exhausted
-    assert last_exc is not None
-    raise last_exc
+    if result == "EMPTY":
+        return ""
+    return result
 
 
 def log_history(raw: str, cleaned: str, status: str):
@@ -562,12 +499,10 @@ class FreeflowDaemon:
         # Empty buffer means no frames or corrupt audio — don't hit the API
         if audio_buf.getbuffer().nbytes == 0:
             print("[freeflow] No usable audio — skipping")
-            play_beep(frequency=220, duration=0.15, volume=0.2)  # low beep = error
+            play_beep(frequency=220, duration=0.15, volume=0.2)
             return
 
-        context = get_context(self._session)
-
-        # Stage 1: Transcribe (with retry). If this fails we have nothing.
+        # Transcribe. If Whisper fails, there's nothing to paste — beep + bail.
         try:
             raw = transcribe(self._client, audio_buf)
         except Exception as e:
@@ -577,40 +512,36 @@ class FreeflowDaemon:
             return
 
         if not raw:
-            print("[freeflow] Empty transcription — nothing to paste")
+            print("[freeflow] Empty transcription")
             log_history("", "", "empty_transcription")
             return
         print(f"[freeflow] Raw transcript: {raw!r}")
 
-        # Stage 2: Post-process (with retry + model fallback). If this fails,
-        # paste the raw transcript — user's speech is too valuable to discard.
-        cleaned = raw
+        # Post-process — single shot, no retries. ANY error -> paste raw.
+        context = get_context(self._session)
+        text_to_paste = raw
         status = "ok"
         try:
-            processed = post_process(self._client, raw, context)
-            if processed:
-                cleaned = processed
+            cleaned = post_process(self._client, raw, context)
+            if cleaned:
+                text_to_paste = cleaned
                 print(f"[freeflow] Cleaned: {cleaned!r}")
             else:
                 print("[freeflow] Post-processor returned EMPTY — nothing to paste")
                 log_history(raw, "", "post_empty")
                 return
         except Exception as e:
-            print(f"[freeflow] Post-processing failed entirely: {e}", flush=True)
-            print("[freeflow] Falling back to raw Whisper transcript", flush=True)
+            print(f"[freeflow] Post-process failed, pasting raw: {e}", flush=True)
             status = f"post_failed: {e}"
-            # Distinctive two-tone beep = "pasted but uncleaned"
-            play_beep(frequency=660, duration=0.06, volume=0.2)
-            play_beep(frequency=440, duration=0.06, volume=0.2)
 
-        # Stage 3: Paste. If this fails, the transcript is still in the log.
+        # Paste. History log captures result either way.
         try:
-            paste_text(cleaned, self._session)
+            paste_text(text_to_paste, self._session)
             print("[freeflow] Pasted.")
-            log_history(raw, cleaned, status)
+            log_history(raw, text_to_paste, status)
         except Exception as e:
             print(f"[freeflow] Paste failed: {e}", flush=True)
-            log_history(raw, cleaned, f"paste_failed: {e}")
+            log_history(raw, text_to_paste, f"paste_failed: {e}")
             play_beep(frequency=220, duration=0.15, volume=0.2)
 
     async def _monitor_device(self, dev: InputDevice):
