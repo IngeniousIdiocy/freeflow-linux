@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import io
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -76,7 +77,9 @@ Output rules:
 - Return ONLY the cleaned transcript text, nothing else.
 - If the transcription is empty, return exactly: EMPTY
 - Do not add words, names, or content that are not in the transcription. The context is only for correcting spelling of words already spoken.
-- Do not change the meaning of what was said."""
+- Do not change the meaning of what was said.
+
+/no_think"""
 
 
 def load_config() -> dict:
@@ -339,8 +342,15 @@ class AudioRecorder:
 # Groq integration
 # ---------------------------------------------------------------------------
 
-# Fastest Groq model — snappiness wins over polish. Any error -> raw Whisper.
-POST_PROCESS_MODEL = "llama-3.1-8b-instant"
+# Fastest Groq model on this machine (~200ms vs 300-400ms for alternatives) AND
+# faithful to user intent (doesn't drop content). The /no_think suffix in the
+# system prompt disables Qwen3's thinking mode for low-latency replies, but the
+# model still emits an empty <think></think> block we strip below.
+# Any error -> raw Whisper. See feedback_snappiness-over-resilience memory.
+POST_PROCESS_MODEL = "qwen/qwen3-32b"
+
+# Match <think>...</think> blocks (Qwen3 emits these even with /no_think)
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
 # Safety-net log: every transcript is appended here so nothing is ever lost.
 HISTORY_LOG = Path("/tmp/freeflow-history.log")
@@ -357,8 +367,8 @@ def transcribe(client: Groq, audio_buf: io.BytesIO) -> str:
 
 
 def post_process(client: Groq, transcript: str, context: str = "") -> str:
-    """Single fast call to llama-3.1-8b-instant. Raises on any error — caller
-    is expected to fall back to the raw transcript immediately, no retries."""
+    """Single fast call to the post-processing model. Raises on any error —
+    caller is expected to fall back to the raw transcript immediately."""
     user_message = (
         f"Instructions: Clean up RAW_TRANSCRIPTION and return only the cleaned "
         f"transcript text without surrounding quotes. Return EMPTY if there should be no result.\n\n"
@@ -374,7 +384,10 @@ def post_process(client: Groq, transcript: str, context: str = "") -> str:
             {"role": "user", "content": user_message},
         ],
     )
-    result = response.choices[0].message.content.strip()
+    result = response.choices[0].message.content
+
+    # Qwen3 emits an empty <think></think> block at the start even with /no_think
+    result = _THINK_BLOCK_RE.sub("", result, count=1).strip()
 
     # Strip outer quotes if the LLM wrapped the entire response
     if len(result) >= 2 and result[0] == result[-1] and result[0] in ('"', "'"):
