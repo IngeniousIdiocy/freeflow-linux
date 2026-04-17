@@ -202,6 +202,17 @@ def play_beep(frequency=880, duration=0.1, volume=0.3):
         pass  # never crash on beep failure
 
 
+def play_error_beep():
+    """Loud triple-beep at 1000 Hz — unmissable on the GPD speaker."""
+    try:
+        sr = 16000
+        beep = (np.sin(2 * np.pi * 1000 * np.linspace(0, 0.12, int(sr * 0.12), False)) * 32767).astype(np.int16)
+        gap = np.zeros(int(sr * 0.08), dtype=np.int16)
+        sd.play(np.concatenate([beep, gap, beep, gap, beep]), samplerate=sr, blocking=True)
+    except Exception:
+        pass
+
+
 class AudioRecorder:
     SAMPLE_RATE = 16000
     CHANNELS = 1
@@ -512,7 +523,7 @@ class FreeflowDaemon:
         # Empty buffer means no frames or corrupt audio — don't hit the API
         if audio_buf.getbuffer().nbytes == 0:
             print("[freeflow] No usable audio — skipping")
-            play_beep(frequency=220, duration=0.15, volume=0.2)
+            play_error_beep()
             return
 
         # Transcribe. If Whisper fails, there's nothing to paste — beep + bail.
@@ -521,7 +532,7 @@ class FreeflowDaemon:
         except Exception as e:
             print(f"[freeflow] Transcription failed: {e}", flush=True)
             log_history("", "", f"transcribe_failed: {e}")
-            play_beep(frequency=220, duration=0.15, volume=0.2)
+            play_error_beep()
             return
 
         if not raw:
@@ -555,7 +566,7 @@ class FreeflowDaemon:
         except Exception as e:
             print(f"[freeflow] Paste failed: {e}", flush=True)
             log_history(raw, text_to_paste, f"paste_failed: {e}")
-            play_beep(frequency=220, duration=0.15, volume=0.2)
+            play_error_beep()
 
     async def _monitor_device(self, dev: InputDevice):
         try:
